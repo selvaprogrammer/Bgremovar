@@ -4,14 +4,14 @@ import VideoCanvas from './components/VideoCanvas';
 import VideoTimeline from './components/Controls/VideoTimeline';
 import BackgroundTab from './components/Controls/BackgroundTab';
 import WatermarkTab from './components/Controls/WatermarkTab';
-import ExportModal from './components/Controls/ExportModal';
+import ExportPanel from './components/Controls/ExportPanel';
 import { createSampleDemoVideo } from './utils/sampleVideoGenerator';
 import { exportToAlphaWebM } from './utils/webmExporter';
 import { checkPythonBackendHealth, exportViaPythonBackend, convertToLottieViaPython } from './utils/pythonExporter';
 import { applyChromaKey } from './utils/chromaKey';
 import { applySmartSegmentation } from './utils/aiSegmenter';
 import { applyWatermarkRemoval } from './utils/watermarkRemover';
-import { Layers, Eraser, Sparkles, Download, RefreshCw } from 'lucide-react';
+import { Layers, Eraser } from 'lucide-react';
 import confetti from 'canvas-confetti';
 
 export default function App() {
@@ -50,8 +50,7 @@ export default function App() {
     right: 0
   });
 
-  // Export Modal State
-  const [isExportModalOpen, setIsExportModalOpen] = useState(false);
+  // Export State (inline panel, no modal)
   const [isExporting, setIsExporting] = useState(false);
   const [exportProgress, setExportProgress] = useState({ percent: 0, frame: 0, totalFrames: 0 });
   const [exportResult, setExportResult] = useState(null);
@@ -65,7 +64,6 @@ export default function App() {
     setExportResult(null);
     setWatermarkSettings({ drawingMode: false, defaultMode: 'blur', regions: [] });
     setCropSettings({ top: 0, bottom: 0, left: 0, right: 0 });
-    setIsExportModalOpen(false);
   };
 
   const handleLoadSample = async () => {
@@ -155,7 +153,7 @@ export default function App() {
   };
 
   // Start Export Process
-  const handleStartExport = async ({ fps, format = 'webm', includeAudio }) => {
+  const handleStartExport = async ({ fps, format = 'webm', quality = 'balanced', includeAudio = true }) => {
     const video = videoRef.current;
     const canvas = canvasRef.current;
 
@@ -178,13 +176,15 @@ export default function App() {
         cropSettings,
         format,
         fps,
+        quality,
+        includeAudio,
         onProgress: (progress) => {
           setExportProgress(progress);
         },
         onComplete: (blob, url, actualExt, durationSec) => {
           setIsExporting(false);
           const finalDuration = durationSec || ((Date.now() - startTime) / 1000).toFixed(1);
-          setExportResult({ url, ext: actualExt, durationSec: finalDuration });
+          setExportResult({ url, ext: actualExt, durationSec: finalDuration, size: blob?.size, engine: 'server' });
         },
         onError: (err) => {
           console.warn("Python export failed, attempting client fallback:", err);
@@ -196,12 +196,18 @@ export default function App() {
     }
 
     function runClientFallback() {
+      // Source bitrate (bits/s) so the browser encoder doesn't overshoot the MP4 size
+      const sourceBitrate = (videoFile?.size && video.duration)
+        ? Math.round((videoFile.size * 8 / video.duration) * 0.9)
+        : 0;
       exportTaskRef.current = exportToAlphaWebM({
         videoElement: video,
         canvasElement: canvas,
         renderFrameFn: renderExportFrame,
         fps,
         format,
+        quality,
+        sourceBitrate,
         includeAudio,
         onProgress: (progress) => {
           setExportProgress(progress);
@@ -209,7 +215,7 @@ export default function App() {
         onComplete: (blob, url, actualExt) => {
           setIsExporting(false);
           const finalDuration = ((Date.now() - startTime) / 1000).toFixed(1);
-          setExportResult({ url, ext: actualExt, durationSec: finalDuration });
+          setExportResult({ url, ext: actualExt, durationSec: finalDuration, size: blob?.size, engine: 'browser' });
         },
         onError: (err) => {
           console.error("Export error:", err);
@@ -342,46 +348,22 @@ export default function App() {
               )}
             </div>
 
-            {/* Bottom Action Card Buttons: Reset & Export */}
-            <div style={{ display: 'flex', gap: '0.6rem', paddingTop: '0.75rem', borderTop: '1px solid var(--border-color)', flexShrink: 0, marginTop: 'auto' }}>
-              <button 
-                className="btn-secondary" 
-                onClick={handleReset}
-                style={{ fontSize: '0.82rem', flex: 1, justifyContent: 'center', padding: '0.45rem' }}
-                title="Reset Video & Settings"
-              >
-                <RefreshCw size={15} />
-                Reset
-              </button>
-              <button 
-                className="btn-primary" 
-                onClick={() => setIsExportModalOpen(true)}
-                style={{ fontSize: '0.82rem', flex: 2, justifyContent: 'center', padding: '0.45rem' }}
-              >
-                <Download size={15} />
-                Export Alpha WebM
-              </button>
-            </div>
+            {/* Inline Export: upload, convert & download on the same screen */}
+            <ExportPanel
+              onStartExport={handleStartExport}
+              isExporting={isExporting}
+              exportProgress={exportProgress}
+              exportResult={exportResult}
+              videoName={videoFile?.name}
+              inputSize={videoFile?.size}
+              onReexport={() => setExportResult(null)}
+              onUploadNewVideo={handleFileSelected}
+              onReset={handleReset}
+            />
           </aside>
         </main>
       )}
 
-      {/* Export Modal */}
-      <ExportModal 
-        isOpen={isExportModalOpen}
-        onClose={() => setIsExportModalOpen(false)}
-        onStartExport={handleStartExport}
-        isExporting={isExporting}
-        exportProgress={exportProgress}
-        exportResult={exportResult}
-        videoName={videoFile?.name}
-        onReexport={() => setExportResult(null)}
-        onUploadNewVideo={(file) => {
-          handleFileSelected(file);
-          setIsExportModalOpen(false);
-        }}
-        onConvertToLottie={handleConvertToLottie}
-      />
     </div>
   );
 }

@@ -56,6 +56,67 @@ def health_check():
     }
 
 
+# ---------------------------------------------------------------------------
+# Encoding presets
+# CRF (constant quality) + a bitrate CAP derived from the source file, so the
+# transparent WebM stays around (or below) the size of the uploaded MP4.
+# ---------------------------------------------------------------------------
+VP9_QUALITY_PRESETS = {
+    #            crf   cap = source video bitrate x factor   audio
+    "small":    {"crf": 40, "cap_factor": 0.5, "audio": "32k"},
+    "balanced": {"crf": 35, "cap_factor": 0.8, "audio": "48k"},
+    "high":     {"crf": 30, "cap_factor": 1.2, "audio": "96k"},
+}
+
+
+def probe_video_bitrate(path: str, duration_hint: float = 0.0) -> int:
+    """Video-stream bitrate (bits/s) of the uploaded file. Falls back to file size / duration."""
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-select_streams", "v:0",
+             "-show_entries", "stream=bit_rate:format=bit_rate,duration", "-of", "json", path],
+            capture_output=True, text=True, timeout=20
+        ).stdout
+        info = json.loads(out or "{}")
+        stream_br = (info.get("streams") or [{}])[0].get("bit_rate")
+        if stream_br and str(stream_br).isdigit():
+            return int(stream_br)
+        fmt = info.get("format") or {}
+        if fmt.get("bit_rate") and str(fmt["bit_rate"]).isdigit():
+            return int(int(fmt["bit_rate"]) * 0.9)
+        dur = float(fmt.get("duration") or duration_hint or 0)
+        if dur > 0:
+            return int(os.path.getsize(path) * 8 / dur * 0.9)
+    except Exception as e:
+        print(f"ffprobe bitrate probe failed: {e}")
+    return 0
+
+
+def vp9_encode_args(quality: str, fps: Optional[float] = None, source_bitrate: int = 0):
+    preset = VP9_QUALITY_PRESETS.get(quality, VP9_QUALITY_PRESETS["balanced"])
+    gop = int(max(1, (fps or 30)) * 8)  # keyframe every ~8s
+    cap = int(source_bitrate * preset["cap_factor"]) if source_bitrate > 0 else 0
+    cap = max(cap, 120_000) if cap else 0
+    return [
+        "-c:v", "libvpx-vp9",
+        "-crf", str(preset["crf"]),
+        "-b:v", f"{cap // 1000}k" if cap else "0",   # constrained quality: never above cap
+        "-deadline", "good",
+        "-cpu-used", "5",
+        "-row-mt", "1",
+        "-threads", "0",
+        "-g", str(gop),
+        "-metadata:s:v:0", "alpha_mode=1",
+    ]
+
+
+def audio_args(include_audio: bool, quality: str):
+    if not include_audio:
+        return ["-an"]
+    preset = VP9_QUALITY_PRESETS.get(quality, VP9_QUALITY_PRESETS["balanced"])
+    return ["-c:a", "libopus", "-b:a", preset["audio"]]
+
+
 def hex_to_rgb(hex_str: str):
     hex_clean = hex_str.lstrip('#')
     if len(hex_clean) == 3:
@@ -63,58 +124,77 @@ def hex_to_rgb(hex_str: str):
     return tuple(int(hex_clean[i:i+2], 16) for i in (0, 2, 4))
 
 
-def process_chroma_key(img_bgr, key_rgb, similarity=0.4, smoothness=0.1, spill=0.5):
+def process_chroma_key(img_bgr, key_rgb, similarity=0.35, smoothness=0.1, spill=0.3):
     """
-    High-performance NumPy vectorized Chroma Key algorithm with spill suppression
-    """
-    key_r, key_g, key_b = key_rgb
-    
-    # Convert BGR input to float RGB for precise distance calculation
-    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
-    
-    # Distance in RGB space
-    dr = img_rgb[:, :, 0] - key_r
-    dg = img_rgb[:, :, 1] - key_g
-    db = img_rgb[:, :, 2] - key_b
-    
-    dist = np.sqrt(dr*dr + dg*dg + db*db)
-    
-    max_dist = 441.6729559300637 # sqrt(255^2 * 3)
-    norm_dist = dist / max_dist
-    
-    # Similarity and smoothness thresholds
-    thresh = max(0.05, similarity)
-    feather = thresh + max(0.01, smoothness)
-    
-    # Alpha mask generation
-    alpha = np.zeros_like(norm_dist, dtype=np.float32)
-    
-    # Foreground pixels
-    alpha[norm_dist >= feather] = 1.0
-    
-    # Feather zone
-    feather_mask = (norm_dist >= thresh) & (norm_dist < feather)
-    if np.any(feather_mask):
-        alpha[feather_mask] = (norm_dist[feather_mask] - thresh) / (feather - thresh)
-        
-    # Spill suppression
-    if spill > 0:
-        # Determine dominant key color channel
-        if key_g >= key_r and key_g >= key_b: # Green Key
-            max_other = np.maximum(img_rgb[:, :, 0], img_rgb[:, :, 2])
-            spill_mask = img_rgb[:, :, 1] > max_other
-            if np.any(spill_mask):
-                excess = (img_rgb[:, :, 1] - max_other) * spill
-                img_rgb[:, :, 1] = np.where(spill_mask, img_rgb[:, :, 1] - excess, img_rgb[:, :, 1])
-        elif key_b >= key_r and key_b >= key_g: # Blue Key
-            max_other = np.maximum(img_rgb[:, :, 0], img_rgb[:, :, 1])
-            spill_mask = img_rgb[:, :, 2] > max_other
-            if np.any(spill_mask):
-                excess = (img_rgb[:, :, 2] - max_other) * spill
-                img_rgb[:, :, 2] = np.where(spill_mask, img_rgb[:, :, 2] - excess, img_rgb[:, :, 2])
+    Green / blue screen key  (input BGR uint8 -> output RGBA uint8).
 
-    rgba = np.dstack((img_rgb.astype(np.uint8), (alpha * 255).astype(np.uint8)))
-    return rgba
+    A pixel is removed ONLY when
+      1. the screen channel (G for green screen) clearly dominates R and B, AND
+      2. its hue is close to the screen's hue.
+    So yellow, lime, teal, cyan, skin, white, black, etc. are never removed.
+    (Old version used plain RGB distance from #00ff00, which also ate teal / lime /
+    dark tones.)
+
+    Size optimisations: tiny alpha noise is snapped to 0/255 and fully transparent
+    pixels are painted flat black, so VP9 doesn't waste bits on hidden green noise.
+    """
+    kr, kg, kb = [float(v) for v in key_rgb]
+    img = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB).astype(np.float32)
+    r, g, b = img[..., 0], img[..., 1], img[..., 2]
+
+    if kg >= kr and kg >= kb:            # green screen -> hue offset from (B - R)
+        ch, main, a1, a2 = 1, g, r, b
+        k_off = 60.0 * (kb - kr) / max(kg - min(kr, kb), 1.0)
+    elif kb >= kr and kb >= kg:          # blue screen -> hue offset from (R - G)
+        ch, main, a1, a2 = 2, b, g, r
+        k_off = 60.0 * (kr - kg) / max(kb - min(kr, kg), 1.0)
+    else:
+        return _distance_key(img, key_rgb, similarity, smoothness)
+
+    other_max = np.maximum(a1, a2)
+    other_min = np.minimum(a1, a2)
+    dom = main - other_max
+
+    # 1) dominance: how strongly the screen channel beats the other two
+    d_lo = 40.0 * (1.0 - similarity)
+    d_hi = d_lo + 10.0 + smoothness * 60.0
+    dom_f = np.clip((dom - d_lo) / (d_hi - d_lo), 0.0, 1.0)
+
+    # 2) hue closeness to the key colour
+    off = 60.0 * (a2 - a1) / np.maximum(main - other_min, 1.0)
+    dh = np.abs(off - k_off)
+    tol = 8.0 + similarity * 30.0
+    feather = 6.0 + smoothness * 30.0
+    hue_f = np.clip(1.0 - (dh - tol) / feather, 0.0, 1.0)
+    hue_f[dom <= 0] = 0.0
+
+    alpha = 1.0 - dom_f * hue_f
+    alpha[alpha < 0.06] = 0.0
+    alpha[alpha > 0.94] = 1.0
+
+    out = img
+    if spill > 0:  # despill only semi-transparent edge pixels
+        m = (alpha > 0) & (alpha < 1) & (dom > 0)
+        out[..., ch] = np.where(m, other_max + (1.0 - spill) * dom, main)
+    out = np.clip(out, 0, 255).astype(np.uint8)
+    a8 = (alpha * 255).astype(np.uint8)
+    out[a8 == 0] = 0
+    return np.dstack((out, a8))
+
+
+def _distance_key(img_rgb_f32, key_rgb, similarity, smoothness):
+    """Fallback for key colours that are neither green nor blue."""
+    kr, kg, kb = key_rgb
+    d = np.sqrt((img_rgb_f32[..., 0] - kr) ** 2 + (img_rgb_f32[..., 1] - kg) ** 2 + (img_rgb_f32[..., 2] - kb) ** 2) / 441.67
+    thresh = max(0.03, similarity * 0.5)
+    feather = thresh + max(0.01, smoothness)
+    alpha = np.clip((d - thresh) / (feather - thresh), 0.0, 1.0)
+    alpha[alpha < 0.06] = 0.0
+    alpha[alpha > 0.94] = 1.0
+    out = img_rgb_f32.astype(np.uint8)
+    a8 = (alpha * 255).astype(np.uint8)
+    out[a8 == 0] = 0
+    return np.dstack((out, a8))
 
 
 def apply_opencv_watermark_and_crop(frame, regions, crops):
@@ -209,212 +289,157 @@ async def export_video(
     file: UploadFile = File(...),
     mode: str = Form("chroma"), # "chroma" or "ai"
     keyColor: str = Form("#00ff00"),
-    similarity: float = Form(0.4),
+    similarity: float = Form(0.35),
     smoothness: float = Form(0.1),
-    spill: float = Form(0.5),
+    spill: float = Form(0.3),
     outputFormat: str = Form("webm"), # "webm" or "mov"
     fps: int = Form(30),
+    quality: str = Form("balanced"),  # "small" | "balanced" | "high"
+    includeAudio: str = Form("true"),
     watermarkRegions: str = Form("[]"),
     cropSettings: str = Form("{}")
 ):
+    include_audio = str(includeAudio).lower() in ("1", "true", "yes", "on")
     if not shutil.which("ffmpeg"):
         raise HTTPException(status_code=500, detail="FFmpeg is not installed on server system")
 
     try:
-        import json
         parsed_regions = json.loads(watermarkRegions) if watermarkRegions else []
     except Exception:
         parsed_regions = []
-
     try:
-        import json
         parsed_crops = json.loads(cropSettings) if cropSettings else {}
     except Exception:
         parsed_crops = {}
 
-    has_watermark = bool(parsed_regions and len(parsed_regions) > 0)
+    has_watermark = bool(parsed_regions)
     has_crop = bool(parsed_crops and any(v > 0 for v in parsed_crops.values() if isinstance(v, (int, float))))
 
-    # Create temporary working directory
     with tempfile.TemporaryDirectory() as temp_dir:
-        input_path = os.path.join(temp_dir, "input_video.mp4")
+        input_path = os.path.join(temp_dir, "input_video")
         with open(input_path, "wb") as f:
-            content = await file.read()
-            f.write(content)
+            f.write(await file.read())
 
-        # Open video stream using OpenCV
         cap = cv2.VideoCapture(input_path)
         if not cap.isOpened():
             raise HTTPException(status_code=400, detail="Unable to read uploaded video file")
-
         width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
         height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
         video_fps = cap.get(cv2.CAP_PROP_FPS) or fps
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         cap.release()
-
         if width <= 0 or height <= 0:
             raise HTTPException(status_code=400, detail="Invalid video dimensions")
 
-        # Output video settings
+        source_bitrate = probe_video_bitrate(input_path, total_frames / video_fps if video_fps else 0)
+
         ext = "webm" if outputFormat == "webm" else "mov"
         output_filename = f"transparent_export.{ext}"
         output_path = os.path.join(temp_dir, output_filename)
-
         key_rgb = hex_to_rgb(keyColor)
-        key_r, key_g, key_b = key_rgb
 
-        # Fast path: Chroma mode ALWAYS uses direct multi-threaded C-filter rendering (1.5s - 2s)
-        if mode == "chroma":
-            key_color_hex = keyColor.replace("#", "0x")
-            vf_filters = [f"colorkey={key_color_hex}:{similarity}:{smoothness}"]
-            
-            if spill > 0:
-                spill_type = "green" if (key_g >= key_r and key_g >= key_b) else "blue"
-                vf_filters.append(f"despill=type={spill_type}:mix={spill}")
-                
-            if outputFormat == "webm":
-                vf_filters.append("format=yuva420p")
-                ffmpeg_cmd = [
-                    "ffmpeg", "-y",
-                    "-i", input_path,
-                    "-vf", ",".join(vf_filters),
-                    "-c:v", "libvpx-vp9",
-                    "-b:v", "6M",
-                    "-deadline", "realtime",
-                    "-cpu-used", "8",
-                    "-threads", "0",
-                    "-row-mt", "1",
-                    "-metadata:s:v:0", "alpha_mode=1",
-                    output_path
-                ]
+        # Only ever reduce frame rate (higher fps = bigger file)
+        out_fps = min(float(fps), float(video_fps)) if fps else float(video_fps)
+        fps_filter = [f"fps={out_fps:g}"] if fps and fps < video_fps - 0.5 else []
+
+        # Output size after crop (even numbers required by yuva420p)
+        out_w, out_h = width, height
+        if has_crop:
+            c_top = int((float(parsed_crops.get("top", 0)) / 100.0) * height)
+            c_bot = int((float(parsed_crops.get("bottom", 0)) / 100.0) * height)
+            c_left = int((float(parsed_crops.get("left", 0)) / 100.0) * width)
+            c_right = int((float(parsed_crops.get("right", 0)) / 100.0) * width)
+            out_w = max(2, width - c_left - c_right)
+            out_h = max(2, height - c_top - c_bot)
+        enc_w, enc_h = out_w // 2 * 2, out_h // 2 * 2
+
+        common_in = [
+            "ffmpeg", "-y", "-loglevel", "error",
+            "-f", "rawvideo", "-vcodec", "rawvideo", "-pix_fmt", "rgba",
+            "-s", f"{enc_w}x{enc_h}", "-r", f"{float(video_fps):g}",
+            "-i", "pipe:0",
+            "-i", input_path,                 # 2nd input = original audio
+            "-map", "0:v:0",
+            *(["-map", "1:a:0?"] if include_audio else []),
+            *(["-vf", ",".join(fps_filter)] if fps_filter else []),
+        ]
+        if outputFormat == "webm":
+            ffmpeg_cmd = common_in + [
+                "-pix_fmt", "yuva420p",
+                *vp9_encode_args(quality, out_fps, source_bitrate),
+                *audio_args(include_audio, quality),
+                "-shortest", output_path,
+            ]
+        else:
+            ffmpeg_cmd = common_in + [
+                "-c:v", "prores_ks", "-profile:v", "4", "-pix_fmt", "yuva444p10le",
+                *(["-c:a", "pcm_s16le"] if include_audio else ["-an"]),
+                "-shortest", output_path,
+            ]
+
+        use_ai = mode == "ai" and REMBG_AVAILABLE
+        session = get_rembg_session() if use_ai else None
+
+        def process_frame(frame_bgr):
+            if has_watermark or has_crop:
+                frame_bgr = apply_opencv_watermark_and_crop(frame_bgr, parsed_regions, parsed_crops)
+            if use_ai:
+                pil_img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+                rgba = np.array(remove(pil_img, session=session) if session else remove(pil_img))
             else:
-                vf_filters.append("format=yuva444p10le")
-                ffmpeg_cmd = [
-                    "ffmpeg", "-y",
-                    "-i", input_path,
-                    "-vf", ",".join(vf_filters),
-                    "-c:v", "prores_ks",
-                    "-profile:v", "4",
-                    "-threads", "0",
-                    output_path
-                ]
+                rgba = process_chroma_key(frame_bgr, key_rgb, similarity, smoothness, spill)
+            if rgba.shape[1] != enc_w or rgba.shape[0] != enc_h:
+                rgba = rgba[:enc_h, :enc_w]
+            return np.ascontiguousarray(rgba).tobytes()
 
-            proc = subprocess.run(ffmpeg_cmd, capture_output=True, text=True)
-            if proc.returncode != 0:
-                print(f"Direct FFmpeg filter error: {proc.stderr}")
-                mode = "fallback_frame_loop"
-            else:
-                mode = "direct_done"
-
-        if mode != "direct_done":
+        def run_pipeline():
+            from concurrent.futures import ThreadPoolExecutor
+            from collections import deque
+            workers = 1 if use_ai else max(1, (os.cpu_count() or 2))
+            proc = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
             cap = cv2.VideoCapture(input_path)
-            
-            # Recalculate dimensions if crop applies
-            out_w, out_h = width, height
-            if has_crop:
-                c_top = int((float(parsed_crops.get("top", 0)) / 100.0) * height)
-                c_bot = int((float(parsed_crops.get("bottom", 0)) / 100.0) * height)
-                c_left = int((float(parsed_crops.get("left", 0)) / 100.0) * width)
-                c_right = int((float(parsed_crops.get("right", 0)) / 100.0) * width)
-                out_w = max(1, width - c_left - c_right)
-                out_h = max(1, height - c_top - c_bot)
-
-            if outputFormat == "webm":
-                ffmpeg_cmd = [
-                    "ffmpeg", "-y",
-                    "-f", "rawvideo",
-                    "-vcodec", "rawvideo",
-                    "-pix_fmt", "rgba",
-                    "-s", f"{out_w}x{out_h}",
-                    "-r", str(int(video_fps)),
-                    "-i", "pipe:0",
-                    "-c:v", "libvpx-vp9",
-                    "-pix_fmt", "yuva420p",
-                    "-b:v", "6M",
-                    "-deadline", "realtime",
-                    "-cpu-used", "8",
-                    "-threads", "0",
-                    "-row-mt", "1",
-                    "-metadata:s:v:0", "alpha_mode=1",
-                    output_path
-                ]
-            else:
-                ffmpeg_cmd = [
-                    "ffmpeg", "-y",
-                    "-f", "rawvideo",
-                    "-vcodec", "rawvideo",
-                    "-pix_fmt", "rgba",
-                    "-s", f"{out_w}x{out_h}",
-                    "-r", str(int(video_fps)),
-                    "-i", "pipe:0",
-                    "-c:v", "prores_ks",
-                    "-profile:v", "4",
-                    "-threads", "0",
-                    "-pix_fmt", "yuva444p10le",
-                    output_path
-                ]
-
-            process = subprocess.Popen(ffmpeg_cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
-            session = get_rembg_session() if mode == "ai" else None
-
             try:
-                while True:
-                    ret, frame_bgr = cap.read()
-                    if not ret:
-                        break
-
-                    # 1. Apply OpenCV Telea Inpainting & Crop to remove watermark on top of objects
-                    if has_watermark or has_crop:
-                        frame_bgr = apply_opencv_watermark_and_crop(frame_bgr, parsed_regions, parsed_crops)
-
-                    # 2. Apply Background Removal
-                    if mode == "ai" and REMBG_AVAILABLE:
-                        img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-                        pil_img = Image.fromarray(img_rgb)
-                        if session:
-                            res_pil = remove(pil_img, session=session)
-                        else:
-                            res_pil = remove(pil_img)
-                        rgba_frame = np.array(res_pil)
-                    else:
-                        rgba_frame = process_chroma_key(
-                            frame_bgr,
-                            key_rgb=key_rgb,
-                            similarity=similarity,
-                            smoothness=smoothness,
-                            spill=spill
-                        )
-
-                    process.stdin.write(rgba_frame.tobytes())
-
-                process.stdin.close()
-                process.wait()
-            except Exception as err:
-                try: process.kill()
+                with ThreadPoolExecutor(max_workers=workers) as pool:
+                    pending = deque()
+                    while True:
+                        ok, frame = cap.read()
+                        if not ok:
+                            break
+                        pending.append(pool.submit(process_frame, frame))
+                        if len(pending) >= workers * 2:          # keep order, bounded memory
+                            proc.stdin.write(pending.popleft().result())
+                    while pending:
+                        proc.stdin.write(pending.popleft().result())
+                proc.stdin.close()
+                err = proc.stderr.read().decode(errors="ignore")
+                proc.wait()
+                if proc.returncode != 0:
+                    raise RuntimeError(err[-800:])
+            except Exception:
+                try: proc.kill()
                 except Exception: pass
-                raise HTTPException(status_code=500, detail=f"Frame processing error: {err}")
+                raise
             finally:
                 cap.release()
+
+        try:
+            await asyncio.to_thread(run_pipeline)
+        except Exception as err:
+            raise HTTPException(status_code=500, detail=f"Frame processing error: {err}")
 
         if not os.path.exists(output_path) or os.path.getsize(output_path) == 0:
             raise HTTPException(status_code=500, detail="FFmpeg encoding failed to generate file output")
 
-        # Read exported binary into memory to return
-        with open(output_path, "rb") as out_f:
-            file_bytes = out_f.read()
-
-        media_type = "video/webm" if outputFormat == "webm" else "video/quicktime"
-        
-        # Save temp file for download
         final_temp = tempfile.NamedTemporaryFile(delete=False, suffix=f".{ext}")
-        final_temp.write(file_bytes)
+        with open(output_path, "rb") as out_f:
+            final_temp.write(out_f.read())
         final_temp.close()
 
         return FileResponse(
             path=final_temp.name,
             filename=output_filename,
-            media_type=media_type,
+            media_type="video/webm" if outputFormat == "webm" else "video/quicktime",
+            headers={"X-Source-Bitrate": str(source_bitrate)},
             background=BackgroundTasks()
         )
 

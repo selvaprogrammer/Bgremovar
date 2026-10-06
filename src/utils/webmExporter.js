@@ -9,7 +9,22 @@ import { Muxer, ArrayBufferTarget } from 'webm-muxer';
 /**
  * Probe available VideoEncoder configurations to find one supporting transparent alpha encoding
  */
-async function getSupportedWebCodecsConfig(width, height, fps) {
+// Bitrate = source file's bitrate x factor, so the WebM stays at or below the
+// uploaded MP4's size. (Old code used a fixed 8 Mbps -> 600 KB MP4 became 3+ MB.)
+const QUALITY_FACTOR = { small: 0.5, balanced: 0.8, high: 1.2 };
+const QUALITY_BPP = { small: 0.02, balanced: 0.035, high: 0.06 }; // used only if source bitrate unknown
+
+export function getTargetBitrate(width, height, fps, quality = 'balanced', sourceBitrate = 0) {
+  let bitrate;
+  if (sourceBitrate > 0) {
+    bitrate = sourceBitrate * (QUALITY_FACTOR[quality] ?? QUALITY_FACTOR.balanced);
+  } else {
+    bitrate = width * height * fps * (QUALITY_BPP[quality] ?? QUALITY_BPP.balanced);
+  }
+  return Math.round(Math.max(120_000, Math.min(bitrate, 2_500_000)));
+}
+
+async function getSupportedWebCodecsConfig(width, height, fps, bitrate) {
   if (typeof VideoEncoder === 'undefined' || typeof VideoFrame === 'undefined') {
     return null;
   }
@@ -20,7 +35,7 @@ async function getSupportedWebCodecsConfig(width, height, fps) {
       codec: 'vp09.00.10.08',
       width,
       height,
-      bitrate: 8_000_000,
+      bitrate,
       framerate: fps,
       alpha: 'keep',
       hardwareAcceleration: 'prefer-software'
@@ -30,7 +45,7 @@ async function getSupportedWebCodecsConfig(width, height, fps) {
       codec: 'vp8',
       width,
       height,
-      bitrate: 8_000_000,
+      bitrate,
       framerate: fps,
       alpha: 'keep',
       hardwareAcceleration: 'prefer-software'
@@ -40,7 +55,7 @@ async function getSupportedWebCodecsConfig(width, height, fps) {
       codec: 'vp09.00.10.08',
       width,
       height,
-      bitrate: 8_000_000,
+      bitrate,
       framerate: fps,
       alpha: 'keep'
     },
@@ -49,7 +64,7 @@ async function getSupportedWebCodecsConfig(width, height, fps) {
       codec: 'vp8',
       width,
       height,
-      bitrate: 8_000_000,
+      bitrate,
       framerate: fps,
       alpha: 'keep'
     }
@@ -78,6 +93,7 @@ function runMediaRecorderExport({
   renderFrameFn,
   fps,
   duration,
+  bitrate,
   onProgress,
   onComplete,
   onError,
@@ -102,7 +118,9 @@ function runMediaRecorderExport({
   }
 
   try {
-    recorder = selectedMime ? new MediaRecorder(stream, { mimeType: selectedMime }) : new MediaRecorder(stream);
+    const opts = { videoBitsPerSecond: bitrate };
+    if (selectedMime) opts.mimeType = selectedMime;
+    recorder = new MediaRecorder(stream, opts);
   } catch (e) {
     recorder = new MediaRecorder(stream);
   }
@@ -190,6 +208,9 @@ export function exportToAlphaWebM({
   canvasElement,
   renderFrameFn,
   fps = 30,
+  quality = 'balanced',
+  sourceBitrate = 0,
+  // eslint-disable-next-line no-unused-vars
   includeAudio = true,
   onProgress,
   onComplete,
@@ -207,7 +228,8 @@ export function exportToAlphaWebM({
   const height = canvasElement.height || videoElement.videoHeight || 360;
 
   (async () => {
-    const validConfig = await getSupportedWebCodecsConfig(width, height, fps);
+    const bitrate = getTargetBitrate(width, height, fps, quality, sourceBitrate);
+    const validConfig = await getSupportedWebCodecsConfig(width, height, fps, bitrate);
 
     if (validConfig && !isCancelledRef.current) {
       try {
@@ -266,7 +288,7 @@ export function exportToAlphaWebM({
               timestamp: Math.round(time * 1_000_000),
               alpha: 'keep'
             });
-            const isKey = f % 30 === 0;
+            const isKey = f % (fps * 4) === 0; // keyframe every ~4s keeps size down
             encoder.encode(frame, { keyFrame: isKey });
             frame.close();
           } catch (err) {
@@ -301,7 +323,7 @@ export function exportToAlphaWebM({
         if (hasEncoderError && !isCancelledRef.current) {
           console.warn("Falling back to MediaRecorder after VideoEncoder error");
           runMediaRecorderExport({
-            videoElement, canvasElement, renderFrameFn, fps, duration, onProgress, onComplete, onError, isCancelledRef
+            videoElement, canvasElement, renderFrameFn, fps, duration, bitrate, onProgress, onComplete, onError, isCancelledRef
           });
         }
         return;
@@ -313,7 +335,7 @@ export function exportToAlphaWebM({
     // Fallback to MediaRecorder if getSupportedWebCodecsConfig returned null or threw
     if (!isCancelledRef.current) {
       runMediaRecorderExport({
-        videoElement, canvasElement, renderFrameFn, fps, duration, onProgress, onComplete, onError, isCancelledRef
+        videoElement, canvasElement, renderFrameFn, fps, duration, bitrate, onProgress, onComplete, onError, isCancelledRef
       });
     }
   })();

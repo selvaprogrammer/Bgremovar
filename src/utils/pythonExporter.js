@@ -23,6 +23,8 @@ export async function exportViaPythonBackend({
   cropSettings,
   format = 'webm',
   fps = 30,
+  quality = 'balanced',
+  includeAudio = true,
   onProgress,
   onComplete,
   onError
@@ -52,6 +54,8 @@ export async function exportViaPythonBackend({
     formData.append('spill', bgSettings.spill ?? 0.5);
     formData.append('outputFormat', format); // 'webm' or 'mov'
     formData.append('fps', fps);
+    formData.append('quality', quality); // 'small' | 'balanced' | 'high'
+    formData.append('includeAudio', includeAudio ? 'true' : 'false');
     formData.append('watermarkRegions', JSON.stringify(watermarkSettings?.regions || []));
     formData.append('cropSettings', JSON.stringify(cropSettings || { top: 0, bottom: 0, left: 0, right: 0 }));
 
